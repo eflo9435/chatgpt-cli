@@ -13,7 +13,7 @@ if [[ -z "$GPT_ENV_READY" ]]; then
   "
 fi
 
-
+	
 ###############################################################################
 # LOAD ENV (.env)
 ###############################################################################
@@ -256,6 +256,58 @@ echo "Model: $MODEL"
 echo "Project Root: $PROJECT_ROOT"
 echo "============================================================"
 
+doctor() {
+  echo "---- GPTX Doctor ----"
+
+  # Shell & ZLE
+# Interactive shell check (reliable)
+if [[ -o interactive ]]; then
+  echo "Zsh Interactive: OK"
+else
+  echo "Zsh Interactive: NO"
+fi
+
+# ZLE availability hint (no false negatives)
+if [[ -n "$ZLE_VERSION" ]]; then
+  echo "ZLE: AVAILABLE (version $ZLE_VERSION)"
+else
+  echo "ZLE: NOT ATTACHED (startup phase)"
+fi
+
+  # OMZ
+  [[ -d "$HOME/.oh-my-zsh" ]] \
+    && echo "Oh-My-Zsh: OK" \
+    || echo "Oh-My-Zsh: MISSING"
+
+  # Python
+  if command -v /opt/homebrew/bin/python3.11 >/dev/null; then
+    echo "Python 3.11: OK"
+  else
+    echo "Python 3.11: MISSING"
+  fi
+
+  # OpenAI CLI
+  if /opt/homebrew/bin/python3.11 -m openai -V >/dev/null 2>&1; then
+    echo "OpenAI CLI: OK"
+  else
+    echo "OpenAI CLI: MISSING"
+  fi
+
+  # API key visibility (length only)
+  if [[ ${#OPENAI_API_KEY} -ge 40 ]]; then
+    echo "OPENAI_API_KEY: OK (len=${#OPENAI_API_KEY})"
+  else
+    echo "OPENAI_API_KEY: INVALID (len=${#OPENAI_API_KEY})"
+  fi
+
+  # DB
+  [[ -f "$MEMDB" ]] \
+    && echo "Memory DB: OK" \
+    || echo "Memory DB: MISSING"
+
+  echo "---------------------"
+}
+
 ###############################################################################
 # MAIN LOOP
 ###############################################################################
@@ -295,11 +347,12 @@ while true; do
 
   [[ -z "$USER_INPUT" ]] && continue
 
-  case "$USER_INPUT" in
-    "/projects list") projects_list; continue ;;
-    "/projects new "*) projects_new "${USER_INPUT#*/projects new }"; continue ;;
-    "/projects open "*) projects_open "${USER_INPUT#*/projects open }"; continue ;;
-  esac
+case "$USER_INPUT" in
+  "/doctor") doctor; continue ;;
+  "/projects list") projects_list; continue ;;
+  "/projects new "*) projects_new "${USER_INPUT#*/projects new }"; continue ;;
+  "/projects open "*) projects_open "${USER_INPUT#*/projects open }"; continue ;;
+esac
   
 ###############################################################################
 # MEMORY COMMANDS
