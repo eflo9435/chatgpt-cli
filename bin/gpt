@@ -13,6 +13,7 @@ if [[ -z "$GPT_ENV_READY" ]]; then
   "
 fi
 
+
 ###############################################################################
 # LOAD ENV (.env)
 ###############################################################################
@@ -49,6 +50,8 @@ COLOR_RESET="\033[0m"
 
 MODEL="gpt-4.1"
 
+SYSTEM_PROMPT="You are ChatGPT Expert Mode v4.3 in Assistant Mode."
+
 ###############################################################################
 # SAFE ZLE INPUT WRAPPER
 ###############################################################################
@@ -80,7 +83,9 @@ ask_permission() {
   [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
-OPENAI=(/opt/homebrew/bin/python3.11 -m openai)
+OPENAI_CMD() {
+  /opt/homebrew/bin/python3.11 -m openai -k "$OPENAI_API_KEY" "$@"
+}
 
 log() {
   echo "[$(date '+%F %T')] $1" >> "$SESSION_LOG"
@@ -255,6 +260,32 @@ echo "============================================================"
 # MAIN LOOP
 ###############################################################################
 
+###############################################################################
+# MEMORY (OPT-IN)
+###############################################################################
+MEMORY_ENABLED=0        # set to 1 to enable
+MEMORY_LIMIT=20         # max messages to load per project
+
+memory_add() {
+  local role="$1"
+  local content="$2"
+  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
+  sqlite3 "$MEMDB" <<SQL
+INSERT INTO messages (project, role, content)
+VALUES ('$CURRENT_PROJECT', '$role', '$content');
+SQL
+}
+
+memory_load() {
+  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
+  sqlite3 "$MEMDB" <<SQL
+SELECT role, content FROM messages
+WHERE project='$CURRENT_PROJECT'
+ORDER BY created_at DESC
+LIMIT $MEMORY_LIMIT;
+SQL
+}
+
 typeset -g USER_INPUT=""
 MESSAGES=()
 
@@ -269,20 +300,54 @@ while true; do
     "/projects new "*) projects_new "${USER_INPUT#*/projects new }"; continue ;;
     "/projects open "*) projects_open "${USER_INPUT#*/projects open }"; continue ;;
   esac
+  
+###############################################################################
+# MEMORY COMMANDS
+###############################################################################
+case "$USER_INPUT" in
+  "/memory on")
+    MEMORY_ENABLED=1
+    echo "Memory ENABLED for project: $CURRENT_PROJECT"
+    continue
+    ;;
+  "/memory off")
+    MEMORY_ENABLED=0
+    echo "Memory DISABLED"
+    continue
+    ;;
+  "/memory show")
+    echo "---- Memory (most recent) ----"
+    memory_load | sed 's/^/• /'
+    echo "-----------------------------"
+    continue
+    ;;
+  "/memory clear")
+    if [[ -z "$CURRENT_PROJECT" ]]; then
+      echo "No active project."
+    else
+      sqlite3 "$MEMDB" "DELETE FROM messages WHERE project='$CURRENT_PROJECT';"
+      echo "Memory CLEARED for project: $CURRENT_PROJECT"
+    fi
+    continue
+    ;;
+esac
+
 
   MESSAGES+=(-g user "$USER_INPUT")
+  memory_add "user" "$USER_INPUT"
 
 RAW=$(
-  "${OPENAI[@]}" api chat.completions.create \
+  OPENAI_CMD api chat.completions.create \
     --model "$MODEL" \
-    -g system "You are ChatGPT Expert Mode v4.3 in Assistant Mode." \
+    -g system "$SYSTEM_PROMPT" \
     -g user "$USER_INPUT" \
     --stream
 )
 
-
   echo ""
   echo "${COLOR_GPT}$RAW${COLOR_RESET}"
+  memory_add "assistant" "$RAW"
+
 
   if parse_tool_call "$RAW"; then
     run_registered_function
