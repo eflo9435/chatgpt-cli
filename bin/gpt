@@ -1,0 +1,290 @@
+#!/bin/zsh
+
+###############################################################################
+# GPT EXPERT MODE v4.3 — FULL ZSH / ZLE / OH-MY-ZSH ENVIRONMENT LOADER
+###############################################################################
+
+# --- Ensure OMZ, plugins, and full ZLE system are loaded exactly as terminal ---
+if [[ -z "$GPT_ENV_READY" ]]; then
+  export GPT_ENV_READY=1
+  exec zsh -i -c "
+    source ~/.zshrc
+    \"$0\" \"$@\"
+  "
+fi
+
+###############################################################################
+# LOAD ENV (.env)
+###############################################################################
+if [[ -f "$PWD/.env" ]]; then
+  set -a
+  source "$PWD/.env"
+  set +a
+fi
+
+if [[ -z "$OPENAI_API_KEY" ]]; then
+  echo "ERROR: OPENAI_API_KEY not set"
+  echo "Create a .env file with OPENAI_API_KEY=sk-..."
+  exit 1
+fi
+
+
+###############################################################################
+# BASIC SETTINGS
+###############################################################################
+setopt NO_NOMATCH
+set -o emacs
+
+LOGDIR=~/gpt_logs
+MEMDB=~/.gpt_memory.db
+PROJECT_ROOT=~/gpt_projects
+
+mkdir -p "$LOGDIR" "$PROJECT_ROOT"
+
+SESSION_LOG="$LOGDIR/session_$(date '+%Y-%m-%d_%H-%M-%S').txt"
+
+COLOR_USER="\033[1;34m"
+COLOR_GPT="\033[1;35m"
+COLOR_RESET="\033[0m"
+
+MODEL="gpt-4.1"
+
+###############################################################################
+# SAFE ZLE INPUT WRAPPER
+###############################################################################
+safe_vared() {
+  local VAR="$1"
+
+  # fallback when ZLE is not available
+  if ! zle >/dev/null 2>&1; then
+    read "$VAR"
+    return
+  fi
+
+  # create var if missing
+  if ! typeset -p "$VAR" >/dev/null 2>&1; then
+    typeset -g "$VAR"=""
+  fi
+
+  vared "$VAR"
+}
+
+###############################################################################
+# TOOL REGISTRATION + HANDLERS
+###############################################################################
+ask_permission() {
+  echo ""
+  echo "  $1"
+  printf "Approve? (y/n): "
+  read ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+OPENAI=(/opt/homebrew/bin/python3.11 -m openai)
+
+log() {
+  echo "[$(date '+%F %T')] $1" >> "$SESSION_LOG"
+}
+
+parse_tool_call() {
+  echo "$1" | jq -e 'select(.tool != null)' >/dev/null 2>&1 || return 1
+  echo "$1" > /tmp/gpt_function_call.json
+  return 0
+}
+
+tool_create_file() {
+  FILENAME=$(jq -r '.arguments.filename' /tmp/gpt_function_call.json)
+  CONTENT=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
+
+  if [[ -z "$CURRENT_PROJECT" ]]; then
+    echo "ERROR: No active project."
+    return
+  fi
+
+  mkdir -p "$PROJECT_ROOT/$CURRENT_PROJECT/files"
+  DEST="$PROJECT_ROOT/$CURRENT_PROJECT/files/$FILENAME"
+
+  if ask_permission "Create file: $DEST"; then
+    echo "$CONTENT" > "$DEST"
+    echo "File created: $DEST"
+  else
+    echo "Denied."
+  fi
+}
+
+tool_write_file() {
+  FILE=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  CONTENT=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
+
+  if ask_permission "Write to: $FILE"; then
+    echo "$CONTENT" > "$FILE"
+    echo "Write OK"
+  else
+    echo "Denied."
+  fi
+}
+
+tool_append_file() {
+  FILE=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  CONTENT=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
+
+  if ask_permission "Append to: $FILE"; then
+    echo "$CONTENT" >> "$FILE"
+    echo "Append OK"
+  else
+    echo "Denied."
+  fi
+}
+
+tool_read_file() {
+  FILE=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  [[ -f "$FILE" ]] && cat "$FILE" || echo "ERROR: File not found."
+}
+
+tool_open_in_bbedit() {
+  FILE=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  [[ -f "$FILE" ]] && bbedit "$FILE" || echo "ERROR: Not found."
+}
+
+tool_list_directory() {
+  DIR=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  [[ -d "$DIR" ]] && ls -1 "$DIR" || echo "ERROR: Directory not found."
+}
+
+tool_search_text() {
+  PATTERN=$(jq -r '.arguments.pattern' /tmp/gpt_function_call.json)
+  FILE=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  grep -n "$PATTERN" "$FILE" || echo "No matches."
+}
+
+tool_run_shell() {
+  CMD=$(jq -r '.arguments.command' /tmp/gpt_function_call.json)
+
+  if ask_permission "Run command: $CMD"; then
+    eval "$CMD"
+  else
+    echo "Denied."
+  fi
+}
+
+tool_create_audio() {
+  TEXT=$(jq -r '.arguments.text' /tmp/gpt_function_call.json)
+  FILENAME=$(jq -r '.arguments.filename' /tmp/gpt_function_call.json)
+
+  if [[ -z "$CURRENT_PROJECT" ]]; then
+    echo "ERROR: No active project."
+    return
+  fi
+
+  mkdir -p "$PROJECT_ROOT/$CURRENT_PROJECT/files"
+  DEST="$PROJECT_ROOT/$CURRENT_PROJECT/files/$FILENAME"
+
+  if ask_permission "Generate audio file: $DEST"; then
+    say "$TEXT" -o "$DEST"
+    echo "Audio created: $DEST"
+  else
+    echo "Denied."
+  fi
+}
+
+###############################################################################
+# PROJECT MANAGEMENT
+###############################################################################
+projects_new() {
+  NAME="$1"
+  mkdir -p "$PROJECT_ROOT/$NAME/files"
+  touch "$PROJECT_ROOT/$NAME/notes.md"
+  CURRENT_PROJECT="$NAME"
+  echo "Created and opened project: $NAME"
+}
+
+projects_open() {
+  NAME="$1"
+  [[ -d "$PROJECT_ROOT/$NAME" ]] && CURRENT_PROJECT="$NAME" && echo "Opened: $NAME" || echo "Not found."
+}
+
+projects_list() {
+  ls -1 "$PROJECT_ROOT"
+}
+
+###############################################################################
+# REGISTER TOOLS IN SQLITE
+###############################################################################
+if [[ ! -f "$MEMDB" ]]; then
+  sqlite3 "$MEMDB" "
+    CREATE TABLE functions (name TEXT PRIMARY KEY, schema TEXT, handler TEXT);
+  "
+fi
+
+register_function() {
+  sqlite3 "$MEMDB" <<EOF
+INSERT OR REPLACE INTO functions (name, schema, handler)
+VALUES ('$1', '$2', '$3');
+EOF
+}
+
+run_registered_function() {
+  NAME=$(jq -r '.tool' /tmp/gpt_function_call.json)
+  HANDLER=$(sqlite3 "$MEMDB" "SELECT handler FROM functions WHERE name='$NAME';")
+  [[ -z "$HANDLER" ]] && echo "ERROR: Unknown function: $NAME" && return
+  eval "$HANDLER"
+}
+
+# --- register tools ---
+register_function "create_file"  '{"type":"object","properties":{"filename":{"type":"string"},"content":{"type":"string"}},"required":["filename","content"]}'  "tool_create_file"
+register_function "write_file"   '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}'             "tool_write_file"
+register_function "append_file"  '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}'             "tool_append_file"
+register_function "read_file"    '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}'                                                  "tool_read_file"
+register_function "run_shell"    '{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}'                                            "tool_run_shell"
+register_function "list_directory" '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}'                                                 "tool_list_directory"
+register_function "search_text"  '{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern","path"]}'             "tool_search_text"
+register_function "open_in_bbedit" '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}'                                                 "tool_open_in_bbedit"
+register_function "create_audio" '{"type":"object","properties":{"text":{"type":"string"},"filename":{"type":"string"}},"required":["text","filename"]}'          "tool_create_audio"
+
+###############################################################################
+# HEADER
+###############################################################################
+echo "============================================================"
+echo " GPT EXPERT MODE v4.3 — Assistant Mode + Strict Safety"
+echo "============================================================"
+echo "Model: $MODEL"
+echo "Project Root: $PROJECT_ROOT"
+echo "============================================================"
+
+###############################################################################
+# MAIN LOOP
+###############################################################################
+
+typeset -g USER_INPUT=""
+MESSAGES=()
+
+while true; do
+  print -n "\n${COLOR_USER}You:${COLOR_RESET} "
+    safe_vared USER_INPUT
+
+  [[ -z "$USER_INPUT" ]] && continue
+
+  case "$USER_INPUT" in
+    "/projects list") projects_list; continue ;;
+    "/projects new "*) projects_new "${USER_INPUT#*/projects new }"; continue ;;
+    "/projects open "*) projects_open "${USER_INPUT#*/projects open }"; continue ;;
+  esac
+
+  MESSAGES+=(-g user "$USER_INPUT")
+
+RAW=$(
+  "${OPENAI[@]}" api chat.completions.create \
+    --model "$MODEL" \
+    -g system "You are ChatGPT Expert Mode v4.3 in Assistant Mode." \
+    -g user "$USER_INPUT" \
+    --stream
+)
+
+
+  echo ""
+  echo "${COLOR_GPT}$RAW${COLOR_RESET}"
+
+  if parse_tool_call "$RAW"; then
+    run_registered_function
+  fi
+done
