@@ -23,6 +23,7 @@ fi
 
 if [[ -z "$OPENAI_API_KEY" ]]; then
   echo "ERROR: OPENAI_API_KEY not set"
+  echo "Create a .env file with OPENAI_API_KEY=sk-..."
   exit 1
 fi
 
@@ -32,11 +33,20 @@ fi
 setopt NO_NOMATCH
 set -o emacs
 
+# History (Step F)
+HISTFILE=~/.gpt_history
+HISTSIZE=5000
+SAVEHIST=5000
+setopt INC_APPEND_HISTORY
+setopt SHARE_HISTORY
+
 LOGDIR=~/gpt_logs
 MEMDB=~/.gpt_memory.db
 PROJECT_ROOT=~/gpt_projects
 
 mkdir -p "$LOGDIR" "$PROJECT_ROOT"
+
+SESSION_LOG="$LOGDIR/session_$(date '+%Y-%m-%d_%H-%M-%S').txt"
 
 COLOR_USER="\033[1;34m"
 COLOR_GPT="\033[1;35m"
@@ -46,111 +56,232 @@ MODEL="gpt-4.1"
 SYSTEM_PROMPT="You are ChatGPT Expert Mode v4.3 in Assistant Mode."
 
 ###############################################################################
-# SAFE ZLE INPUT
+# SAFE ZLE INPUT WRAPPER — MULTILINE (STEP F)
 ###############################################################################
 safe_vared() {
   local VAR="$1"
+
+  # Fallback if ZLE unavailable
   if ! zle >/dev/null 2>&1; then
     read "$VAR"
     return
   fi
-  typeset -g "$VAR"
-  vared "$VAR"
+
+  [[ ! -v "$VAR" ]] && typeset -g "$VAR"=""
+
+  # Enable multiline paste / Shift+Enter
+  zle -I
+  vared -M "$VAR"
 }
 
 ###############################################################################
-# OPENAI
+# OPENAI CLI WRAPPER
 ###############################################################################
 OPENAI_CMD() {
   /opt/homebrew/bin/python3.11 -m openai -k "$OPENAI_API_KEY" "$@"
 }
 
 ###############################################################################
-# SQLITE SETUP
+# PERMISSION PROMPTS
 ###############################################################################
-if [[ ! -f "$MEMDB" ]]; then
-  sqlite3 "$MEMDB" <<SQL
-CREATE TABLE messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project TEXT,
-  role TEXT,
-  content TEXT,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE functions (
-  name TEXT PRIMARY KEY,
-  schema TEXT,
-  handler TEXT
-);
-SQL
-fi
-
-###############################################################################
-# MEMORY (REFINED)
-###############################################################################
-MEMORY_ENABLED=0
-MEMORY_LIMIT=20
-
-memory_add() {
-  local role="$1"
-  local content="$2"
-  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
-
-  sqlite3 "$MEMDB" <<SQL
-INSERT INTO messages (project, role, content)
-VALUES ('$CURRENT_PROJECT', '$role', '$content');
-SQL
-
-  memory_prune
+ask_permission() {
+  echo ""
+  echo "  $1"
+  printf "Approve? (y/n): "
+  read ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
-memory_load() {
-  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
-  sqlite3 "$MEMDB" <<SQL
-SELECT role || '|' || content
-FROM messages
-WHERE project='$CURRENT_PROJECT'
-ORDER BY created_at DESC
-LIMIT $MEMORY_LIMIT;
-SQL
-}
-
-memory_stats() {
-  [[ -z "$CURRENT_PROJECT" ]] && return
-  sqlite3 "$MEMDB" \
-    "SELECT COUNT(*) || ' messages stored' FROM messages WHERE project='$CURRENT_PROJECT';"
-}
-
-memory_prune() {
-  [[ -z "$CURRENT_PROJECT" ]] && return
-  sqlite3 "$MEMDB" <<SQL
-DELETE FROM messages
-WHERE id NOT IN (
-  SELECT id FROM messages
-  WHERE project='$CURRENT_PROJECT'
-  ORDER BY created_at DESC
-  LIMIT $MEMORY_LIMIT
+###############################################################################
+# TOOL PERMISSION HARDENING
+###############################################################################
+typeset -A TOOL_PERMISSIONS
+TOOL_PERMISSIONS=(
+  create_file      write
+  write_file       write
+  append_file      write
+  read_file        read
+  list_directory   read
+  search_text      read
+  open_in_bbedit   read
+  create_audio     write
+  run_shell        run
 )
-AND project='$CURRENT_PROJECT';
-SQL
+
+enforce_permission() {
+  local tool="$1"
+  local action="$2"
+  local tier="${TOOL_PERMISSIONS[$tool]:-write}"
+
+  case "$tier" in
+    read)
+      return 0
+      ;;
+    write)
+      ask_permission "Allow WRITE action: $action"
+      return $?
+      ;;
+    run)
+      echo ""
+      echo "⚠️  DANGEROUS OPERATION"
+      echo "Tool: $tool"
+      echo "Action: $action"
+      ask_permission "Proceed with RUN command?"
+      return $?
+      ;;
+    *)
+      echo "ERROR: Unknown permission tier"
+      return 1
+      ;;
+  esac
 }
 
 ###############################################################################
-# PROJECTS
+# TOOL HANDLERS
+###############################################################################
+parse_tool_call() {
+  echo "$1" | jq -e 'select(.tool != null)' >/dev/null 2>&1 || return 1
+  echo "$1" > /tmp/gpt_function_call.json
+}
+
+tool_create_file() {
+  local f=$(jq -r '.arguments.filename' /tmp/gpt_function_call.json)
+  local c=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
+  local d="$PROJECT_ROOT/$CURRENT_PROJECT/files/$f"
+  enforce_permission create_file "$d" || return
+  mkdir -p "$(dirname "$d")"
+  echo "$c" > "$d"
+  echo "File created: $d"
+}
+
+tool_write_file() {
+  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  local c=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
+  enforce_permission write_file "$f" || return
+  echo "$c" > "$f"
+  echo "Write OK"
+}
+
+tool_append_file() {
+  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  local c=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
+  enforce_permission append_file "$f" || return
+  echo "$c" >> "$f"
+  echo "Append OK"
+}
+
+tool_read_file() {
+  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  enforce_permission read_file "$f" || return
+  [[ -f "$f" ]] && cat "$f" || echo "ERROR: File not found"
+}
+
+tool_list_directory() {
+  local d=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  enforce_permission list_directory "$d" || return
+  [[ -d "$d" ]] && ls -1 "$d" || echo "ERROR: Directory not found"
+}
+
+tool_search_text() {
+  local p=$(jq -r '.arguments.pattern' /tmp/gpt_function_call.json)
+  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  enforce_permission search_text "$f" || return
+  grep -n "$p" "$f" || echo "No matches"
+}
+
+tool_open_in_bbedit() {
+  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
+  enforce_permission open_in_bbedit "$f" || return
+  bbedit "$f"
+}
+
+tool_run_shell() {
+  local c=$(jq -r '.arguments.command' /tmp/gpt_function_call.json)
+  enforce_permission run_shell "$c" || return
+  eval "$c"
+}
+
+tool_create_audio() {
+  local t=$(jq -r '.arguments.text' /tmp/gpt_function_call.json)
+  local f="$PROJECT_ROOT/$CURRENT_PROJECT/files/$(jq -r '.arguments.filename' /tmp/gpt_function_call.json)"
+  enforce_permission create_audio "$f" || return
+  say "$t" -o "$f"
+  echo "Audio created: $f"
+}
+
+###############################################################################
+# PROJECT MANAGEMENT
 ###############################################################################
 projects_new() {
   mkdir -p "$PROJECT_ROOT/$1/files"
   CURRENT_PROJECT="$1"
   echo "Created and opened project: $1"
 }
-
 projects_open() {
-  [[ -d "$PROJECT_ROOT/$1" ]] && CURRENT_PROJECT="$1" && echo "Opened: $1" || echo "Not found."
+  [[ -d "$PROJECT_ROOT/$1" ]] && CURRENT_PROJECT="$1" && echo "Opened: $1"
 }
-
 projects_list() {
   ls -1 "$PROJECT_ROOT"
+}
+
+###############################################################################
+# MEMORY (WRITE ON SUCCESS)
+###############################################################################
+MEMORY_ENABLED=0
+MEMORY_LIMIT=20
+
+memory_add() {
+  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
+  sqlite3 "$MEMDB" \
+    "INSERT INTO messages (project, role, content) VALUES ('$CURRENT_PROJECT','$1','$2');"
+}
+
+memory_load() {
+  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
+  sqlite3 "$MEMDB" \
+    "SELECT role, content FROM messages WHERE project='$CURRENT_PROJECT' ORDER BY id DESC LIMIT $MEMORY_LIMIT;"
+}
+
+###############################################################################
+# HELP (STEP F)
+###############################################################################
+help_cmd() {
+  cat <<'EOF'
+Available commands
+------------------
+/help                 Show this help
+/doctor               Environment diagnostics
+/projects list        List projects
+/projects new NAME    Create & open project
+/projects open NAME   Open project
+/memory on|off         Enable / disable memory
+/memory show           Show recent memory
+
+Editing & Input
+---------------
+• Arrow ↑ ↓            History navigation
+• Shift+Enter          Multiline input
+• Ctrl+D               Submit multiline input
+
+Safety
+------
+• Reads auto-approve
+• Writes prompt
+• Runs require confirmation
+EOF
+}
+
+###############################################################################
+# DOCTOR
+###############################################################################
+doctor() {
+  echo "---- GPTX Doctor ----"
+  [[ -o interactive ]] && echo "Zsh Interactive: OK" || echo "Zsh Interactive: NO"
+  [[ -n "$ZLE_VERSION" ]] && echo "ZLE: OK" || echo "ZLE: NOT ATTACHED"
+  [[ -d "$HOME/.oh-my-zsh" ]] && echo "Oh-My-Zsh: OK" || echo "Oh-My-Zsh: MISSING"
+  echo "OPENAI_API_KEY len=${#OPENAI_API_KEY}"
+  [[ -f "$MEMDB" ]] && echo "Memory DB: OK" || echo "Memory DB: MISSING"
+  echo "---------------------"
 }
 
 ###############################################################################
@@ -170,43 +301,40 @@ typeset -g USER_INPUT=""
 
 while true; do
   print -n "\n${COLOR_USER}You:${COLOR_RESET} "
+
+  [[ -z "$USER_INPUT" ]] && print "(type /help for commands)"
+
   safe_vared USER_INPUT
+  USER_INPUT="${USER_INPUT%%[[:space:]]}"
+
   [[ -z "$USER_INPUT" ]] && continue
 
   case "$USER_INPUT" in
-    "/doctor")
-      echo "---- GPTX Doctor ----"
-      [[ -o interactive ]] && echo "Zsh Interactive: OK" || echo "Zsh Interactive: NO"
-      [[ -n "$ZLE_VERSION" ]] && echo "ZLE: AVAILABLE" || echo "ZLE: NOT ATTACHED"
-      [[ -d ~/.oh-my-zsh ]] && echo "Oh-My-Zsh: OK" || echo "Oh-My-Zsh: MISSING"
-      [[ ${#OPENAI_API_KEY} -ge 40 ]] && echo "OPENAI_API_KEY: OK" || echo "OPENAI_API_KEY: INVALID"
-      [[ -f "$MEMDB" ]] && echo "Memory DB: OK" || echo "Memory DB: MISSING"
-      continue ;;
+    "/help") help_cmd; continue ;;
+    "/doctor") doctor; continue ;;
     "/projects list") projects_list; continue ;;
     "/projects new "*) projects_new "${USER_INPUT#*/projects new }"; continue ;;
     "/projects open "*) projects_open "${USER_INPUT#*/projects open }"; continue ;;
     "/memory on") MEMORY_ENABLED=1; echo "Memory ENABLED"; continue ;;
     "/memory off") MEMORY_ENABLED=0; echo "Memory DISABLED"; continue ;;
     "/memory show") memory_load | sed 's/^/• /'; continue ;;
-    "/memory stats") memory_stats; continue ;;
-    "/memory clear")
-      sqlite3 "$MEMDB" "DELETE FROM messages WHERE project='$CURRENT_PROJECT';"
-      echo "Memory CLEARED"
-      continue ;;
   esac
 
   RAW=$(
     OPENAI_CMD api chat.completions.create \
       --model "$MODEL" \
       -g system "$SYSTEM_PROMPT" \
-      -g user "$USER_INPUT"
+      -g user "$USER_INPUT" \
+      --stream
   )
 
+  echo ""
   echo "${COLOR_GPT}$RAW${COLOR_RESET}"
 
-  # WRITE MEMORY ONLY ON SUCCESS
-  if [[ -n "$RAW" && "$RAW" != *"Error"* ]]; then
+  if [[ -n "$RAW" && "$RAW" != *"ERROR:"* ]]; then
     memory_add "user" "$USER_INPUT"
     memory_add "assistant" "$RAW"
   fi
+
+  parse_tool_call "$RAW" && run_registered_function
 done
