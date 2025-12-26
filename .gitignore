@@ -1,0 +1,28 @@
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Environment / secrets
+.env
+.env.*
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Temporary files
+tmp/
+temp/
+
+# Editor backups
+*~
+*.swp
