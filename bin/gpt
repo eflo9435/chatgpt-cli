@@ -1,44 +1,47 @@
 #!/bin/zsh
 
 ###############################################################################
-# GPT EXPERT MODE v4.3 — FULL ZSH / ZLE / OH-MY-ZSH ENVIRONMENT LOADER
+# FORCE INTERACTIVE ZSH + ZLE (SAFE)
 ###############################################################################
-
-if [[ -z "$GPT_ENV_READY" ]]; then
-  export GPT_ENV_READY=1
-  exec zsh -i -c "
-    source ~/.zshrc
-    \"$0\" \"$@\"
-  "
+if [[ -z "$GPTX_INTERACTIVE" ]]; then
+  export GPTX_INTERACTIVE=1
+  exec zsh -i "$0" "$@"
 fi
 
 ###############################################################################
-# LOAD ENV (.env)
+# GPT EXPERT MODE v4.4 — PROJECT-SCOPED, PERMISSION-AWARE AGENT
 ###############################################################################
-if [[ -f "$PWD/.env" ]]; then
+
+
+###############################################################################
+# LOAD ENV (.env) — script-relative
+###############################################################################
+###############################################################################
+# RESOLVE REAL SCRIPT PATH (handles symlinks)
+###############################################################################
+SCRIPT_PATH="$(realpath "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
   set -a
-  source "$PWD/.env"
+  source "$SCRIPT_DIR/.env"
   set +a
 fi
 
-if [[ -z "$OPENAI_API_KEY" ]]; then
-  echo "ERROR: OPENAI_API_KEY not set"
-  echo "Create a .env file with OPENAI_API_KEY=sk-..."
-  exit 1
-fi
 
 ###############################################################################
 # BASIC SETTINGS
 ###############################################################################
+
+trap_ctrl_c() {
+  echo ""
+  echo "👋 Exiting GPTX."
+  exit 0
+}
+trap trap_ctrl_c INT
+
 setopt NO_NOMATCH
 set -o emacs
-
-# History (Step F)
-HISTFILE=~/.gpt_history
-HISTSIZE=5000
-SAVEHIST=5000
-setopt INC_APPEND_HISTORY
-setopt SHARE_HISTORY
 
 LOGDIR=~/gpt_logs
 MEMDB=~/.gpt_memory.db
@@ -46,295 +49,419 @@ PROJECT_ROOT=~/gpt_projects
 
 mkdir -p "$LOGDIR" "$PROJECT_ROOT"
 
-SESSION_LOG="$LOGDIR/session_$(date '+%Y-%m-%d_%H-%M-%S').txt"
-
 COLOR_USER="\033[1;34m"
 COLOR_GPT="\033[1;35m"
 COLOR_RESET="\033[0m"
 
-MODEL="gpt-4.1"
-SYSTEM_PROMPT="You are ChatGPT Expert Mode v4.3 in Assistant Mode."
+DEFAULT_MODEL="gpt-4.1"
+MODEL="$DEFAULT_MODEL"
+MODEL_PROVIDER="openai"
 
 ###############################################################################
-# SAFE ZLE INPUT WRAPPER — MULTILINE (STEP F)
+# MODEL PROVIDER ROUTING
+###############################################################################
+detect_provider() {
+  print_banner
+  case "$MODEL" in
+    gpt-*)      MODEL_PROVIDER="openai" ;;
+    gemini-*)   MODEL_PROVIDER="gemini" ;;
+    claude-*)   MODEL_PROVIDER="anthropic" ;;
+    *)          MODEL_PROVIDER="openai" ;;
+  esac
+}
+
+load_project_model() {
+  MODEL="$DEFAULT_MODEL"
+###############################################################################
+# ONE-SHOT CLI MODE
+###############################################################################
+ONE_SHOT_INPUT=""
+
+if [[ -n "$GPTX_ARGS" ]]; then
+  ONE_SHOT_INPUT="$GPTX_ARGS"
+elif [[ "$#" -gt 0 ]]; then
+  ONE_SHOT_INPUT="$*"
+fi
+
+  [[ -z "$CURRENT_PROJECT" ]] && return
+
+  local f="$PROJECT_ROOT/$CURRENT_PROJECT/.model"
+  [[ -f "$f" ]] || return
+
+  while IFS='=' read -r k v; do
+    [[ "$k" == "MODEL" && -n "$v" ]] && MODEL="$v"
+  done < "$f"
+
+  detect_provider
+}
+
+SYSTEM_PROMPT="You are ChatGPT Expert Mode v4.4 in Assistant Mode."
+
+###############################################################################
+# SAFE INPUT (ZLE-first, no arrow garbage)
 ###############################################################################
 safe_vared() {
-  local VAR="$1"
+  local var="$1"
 
-  # Fallback if ZLE unavailable
-  if ! zle >/dev/null 2>&1; then
-    read "$VAR"
+  # If ZLE is available, ALWAYS use it
+  if zle >/dev/null 2>&1; then
+    vared "$var"
     return
   fi
 
-  [[ ! -v "$VAR" ]] && typeset -g "$VAR"=""
-
-  # Enable multiline paste / Shift+Enter
-  zle -I
-  vared -M "$VAR"
+  # Fallback: plain read, but disable escape interpretation
+  stty -echoctl 2>/dev/null
+  read "$var"
 }
 
 ###############################################################################
-# OPENAI CLI WRAPPER
+# OPENAI
 ###############################################################################
 OPENAI_CMD() {
   /opt/homebrew/bin/python3.11 -m openai -k "$OPENAI_API_KEY" "$@"
 }
 
-###############################################################################
-# PERMISSION PROMPTS
-###############################################################################
-ask_permission() {
-  echo ""
-  echo "  $1"
-  printf "Approve? (y/n): "
-  read ans
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
+openai_request() {
+  local prompt="$1"
+  OPENAI_CMD api chat.completions.create \
+    --model "$MODEL" \
+    -g system "$SYSTEM_PROMPT" \
+    -g user "$prompt"
 }
 
 ###############################################################################
-# TOOL PERMISSION HARDENING
+# GEMINI
 ###############################################################################
-typeset -A TOOL_PERMISSIONS
-TOOL_PERMISSIONS=(
-  create_file      write
-  write_file       write
-  append_file      write
-  read_file        read
-  list_directory   read
-  search_text      read
-  open_in_bbedit   read
-  create_audio     write
-  run_shell        run
-)
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 
-enforce_permission() {
-  local tool="$1"
-  local action="$2"
-  local tier="${TOOL_PERMISSIONS[$tool]:-write}"
-
-  case "$tier" in
-    read)
-      return 0
-      ;;
-    write)
-      ask_permission "Allow WRITE action: $action"
-      return $?
-      ;;
-    run)
-      echo ""
-      echo "⚠️  DANGEROUS OPERATION"
-      echo "Tool: $tool"
-      echo "Action: $action"
-      ask_permission "Proceed with RUN command?"
-      return $?
-      ;;
-    *)
-      echo "ERROR: Unknown permission tier"
-      return 1
-      ;;
-  esac
-}
+gemini_request() {
 
 ###############################################################################
-# TOOL HANDLERS
+# GEMINI OUTPUT NORMALIZATION
 ###############################################################################
-parse_tool_call() {
-  echo "$1" | jq -e 'select(.tool != null)' >/dev/null 2>&1 || return 1
-  echo "$1" > /tmp/gpt_function_call.json
+gemini_extract_text() {
+  jq -r '
+    .candidates[0].content.parts[]
+    | select(.text != null)
+    | .text
+  ' 2>/dev/null
 }
 
-tool_create_file() {
-  local f=$(jq -r '.arguments.filename' /tmp/gpt_function_call.json)
-  local c=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
-  local d="$PROJECT_ROOT/$CURRENT_PROJECT/files/$f"
-  enforce_permission create_file "$d" || return
-  mkdir -p "$(dirname "$d")"
-  echo "$c" > "$d"
-  echo "File created: $d"
+  local prompt="$1"
+
+  curl -s \
+    "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent" \
+    -H "Content-Type: application/json" \
+    -H "x-goog-api-key: $GEMINI_API_KEY" \
+    -d "{
+      \"contents\": [{
+        \"parts\": [{\"text\": \"$prompt\"}]
+      }]
+    }"
+}
+###############################################################################
+# ANTHROPIC (CLAUDE)
+###############################################################################
+# Expected in .env:
+# ANTHROPIC_API_KEY=your_key_here
+
+anthropic_extract_text() {
+  jq -r '
+    .content[]? 
+    | select(.type == "text") 
+    | .text // empty
+  ' 2>/dev/null
 }
 
-tool_write_file() {
-  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
-  local c=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
-  enforce_permission write_file "$f" || return
-  echo "$c" > "$f"
-  echo "Write OK"
+anthropic_request() {
+  local prompt="$1"
+
+  if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+    echo "ERROR: ANTHROPIC_API_KEY is not set"
+    return 1
+  fi
+
+  curl -s https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "{
+      \"model\": \"$MODEL\",
+      \"max_tokens\": 1024,
+      \"messages\": [
+        {\"role\": \"user\", \"content\": \"$prompt\"}
+      ]
+    }"
 }
 
-tool_append_file() {
-  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
-  local c=$(jq -r '.arguments.content' /tmp/gpt_function_call.json)
-  enforce_permission append_file "$f" || return
-  echo "$c" >> "$f"
-  echo "Append OK"
-}
-
-tool_read_file() {
-  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
-  enforce_permission read_file "$f" || return
-  [[ -f "$f" ]] && cat "$f" || echo "ERROR: File not found"
-}
-
-tool_list_directory() {
-  local d=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
-  enforce_permission list_directory "$d" || return
-  [[ -d "$d" ]] && ls -1 "$d" || echo "ERROR: Directory not found"
-}
-
-tool_search_text() {
-  local p=$(jq -r '.arguments.pattern' /tmp/gpt_function_call.json)
-  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
-  enforce_permission search_text "$f" || return
-  grep -n "$p" "$f" || echo "No matches"
-}
-
-tool_open_in_bbedit() {
-  local f=$(jq -r '.arguments.path' /tmp/gpt_function_call.json)
-  enforce_permission open_in_bbedit "$f" || return
-  bbedit "$f"
-}
-
-tool_run_shell() {
-  local c=$(jq -r '.arguments.command' /tmp/gpt_function_call.json)
-  enforce_permission run_shell "$c" || return
-  eval "$c"
-}
-
-tool_create_audio() {
-  local t=$(jq -r '.arguments.text' /tmp/gpt_function_call.json)
-  local f="$PROJECT_ROOT/$CURRENT_PROJECT/files/$(jq -r '.arguments.filename' /tmp/gpt_function_call.json)"
-  enforce_permission create_audio "$f" || return
-  say "$t" -o "$f"
-  echo "Audio created: $f"
-}
 
 ###############################################################################
-# PROJECT MANAGEMENT
+# MODEL COMMANDS (AUTHORITATIVE)
 ###############################################################################
-projects_new() {
-  mkdir -p "$PROJECT_ROOT/$1/files"
-  CURRENT_PROJECT="$1"
-  echo "Created and opened project: $1"
-}
-projects_open() {
-  [[ -d "$PROJECT_ROOT/$1" ]] && CURRENT_PROJECT="$1" && echo "Opened: $1"
-}
-projects_list() {
-  ls -1 "$PROJECT_ROOT"
+model_show() {
+  detect_provider
+  echo "Current model: $MODEL ($MODEL_PROVIDER)"
 }
 
+model_set() {
+  local new="$1"
+
+  [[ -z "$new" ]] && {
+    echo "Usage: /model set MODEL_NAME"
+    return
+  }
+
+  MODEL="$new"
+  detect_provider
+
+  if [[ -n "$CURRENT_PROJECT" ]]; then
+    echo "MODEL=$MODEL" > "$PROJECT_ROOT/$CURRENT_PROJECT/.model"
+    echo "Model set to $MODEL ($MODEL_PROVIDER, project-scoped)"
+  else
+    echo "Model set to $MODEL ($MODEL_PROVIDER, session only)"
+  fi
+}
 ###############################################################################
-# MEMORY (WRITE ON SUCCESS)
+# MEMORY (WRITE-ON-SUCCESS)
 ###############################################################################
 MEMORY_ENABLED=0
 MEMORY_LIMIT=20
 
+sqlite3 "$MEMDB" <<'SQL'
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY,
+  project TEXT,
+  role TEXT,
+  content TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+SQL
+
 memory_add() {
-  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
-  sqlite3 "$MEMDB" \
-    "INSERT INTO messages (project, role, content) VALUES ('$CURRENT_PROJECT','$1','$2');"
+  [[ "$MEMORY_ENABLED" -eq 1 && -n "$CURRENT_PROJECT" ]] || return
+
+  sqlite3 "$MEMDB" <<SQL
+INSERT INTO messages (project, role, content)
+VALUES (
+  '$(printf "%s" "$CURRENT_PROJECT" | sed "s/'/''/g")',
+  '$(printf "%s" "$1" | sed "s/'/''/g")',
+  '$(printf "%s" "$2" | sed "s/'/''/g")'
+);
+SQL
 }
 
 memory_load() {
-  [[ "$MEMORY_ENABLED" -ne 1 || -z "$CURRENT_PROJECT" ]] && return
-  sqlite3 "$MEMDB" \
-    "SELECT role, content FROM messages WHERE project='$CURRENT_PROJECT' ORDER BY id DESC LIMIT $MEMORY_LIMIT;"
+  sqlite3 "$MEMDB" "SELECT role||'|'||content FROM messages
+    WHERE project='$CURRENT_PROJECT'
+    ORDER BY created_at DESC LIMIT $MEMORY_LIMIT;"
+}
+
+memory_prune() {
+  [[ -z "$CURRENT_PROJECT" ]] && return
+
+  sqlite3 "$MEMDB" <<SQL
+DELETE FROM messages
+WHERE id NOT IN (
+  SELECT id FROM messages
+  WHERE project='$CURRENT_PROJECT'
+  ORDER BY created_at DESC
+  LIMIT $MEMORY_LIMIT
+);
+SQL
 }
 
 ###############################################################################
-# HELP (STEP F)
+# TOOL DISPATCH (RESTORED)
 ###############################################################################
-help_cmd() {
-  cat <<'EOF'
-Available commands
-------------------
-/help                 Show this help
-/doctor               Environment diagnostics
-/projects list        List projects
-/projects new NAME    Create & open project
-/projects open NAME   Open project
-/memory on|off         Enable / disable memory
-/memory show           Show recent memory
-
-Editing & Input
----------------
-• Arrow ↑ ↓            History navigation
-• Shift+Enter          Multiline input
-• Ctrl+D               Submit multiline input
-
-Safety
-------
-• Reads auto-approve
-• Writes prompt
-• Runs require confirmation
-EOF
+parse_tool_call() {
+  [[ "$1" == \{* ]] || return 1
+  echo "$1" | jq -e '.tool?' >/dev/null 2>&1 || return 1
+  echo "$1" > /tmp/gpt_tool.json
 }
 
+run_tool() {
+  local name="$(jq -r '.tool' /tmp/gpt_tool.json)"
+  local tier="${TOOL_TIER[$name]}"
+  check_permission "$tier" "$name" || return
+  "tool_$name"
+}
 ###############################################################################
-# DOCTOR
+# MEMORY + TOOL DISPATCH (RESTORED — DO NOT EDIT)
 ###############################################################################
-doctor() {
-  echo "---- GPTX Doctor ----"
-  [[ -o interactive ]] && echo "Zsh Interactive: OK" || echo "Zsh Interactive: NO"
-  [[ -n "$ZLE_VERSION" ]] && echo "ZLE: OK" || echo "ZLE: NOT ATTACHED"
-  [[ -d "$HOME/.oh-my-zsh" ]] && echo "Oh-My-Zsh: OK" || echo "Oh-My-Zsh: MISSING"
-  echo "OPENAI_API_KEY len=${#OPENAI_API_KEY}"
-  [[ -f "$MEMDB" ]] && echo "Memory DB: OK" || echo "Memory DB: MISSING"
-  echo "---------------------"
+
+memory_add() {
+  [[ "$MEMORY_ENABLED" -eq 1 && -n "$CURRENT_PROJECT" ]] || return
+  sqlite3 "$MEMDB" <<SQL
+INSERT INTO messages (project, role, content)
+VALUES (
+  '$(printf "%s" "$CURRENT_PROJECT" | sed "s/'/''/g")',
+  '$(printf "%s" "$1" | sed "s/'/''/g")',
+  '$(printf "%s" "$2" | sed "s/'/''/g")'
+);
+SQL
 }
 
+memory_prune() {
+  [[ -z "$CURRENT_PROJECT" ]] && return
+  sqlite3 "$MEMDB" <<SQL
+DELETE FROM messages
+WHERE id NOT IN (
+  SELECT id FROM messages
+  WHERE project='$CURRENT_PROJECT'
+  ORDER BY created_at DESC
+  LIMIT $MEMORY_LIMIT
+);
+SQL
+}
+
+parse_tool_call() {
+  [[ "$1" == \{* ]] || return 1
+  echo "$1" | jq -e '.tool?' >/dev/null 2>&1 || return 1
+  echo "$1" > /tmp/gpt_tool.json
+}
+
+run_tool() {
+  local name="$(jq -r '.tool' /tmp/gpt_tool.json)"
+  local tier="${TOOL_TIER[$name]}"
+  check_permission "$tier" "$name" || return
+  "tool_$name"
+}
 ###############################################################################
-# HEADER
+# EXIT COMMAND (RESTORED)
 ###############################################################################
-echo "============================================================"
-echo " GPT EXPERT MODE v4.3 — Assistant Mode + Strict Safety"
-echo "============================================================"
-echo "Model: $MODEL"
-echo "Project Root: $PROJECT_ROOT"
-echo "============================================================"
+exit_cmd() {
+  echo ""
+  echo "👋 Exiting GPTX safely."
+  exit 0
+}
+###############################################################################
+# MODEL LIST (ENHANCED)
+###############################################################################
+model_list() {
+  echo ""
+  echo "Available models:"
+  echo ""
+
+  echo "OpenAI:"
+  for m in gpt-4.1 gpt-4o gpt-4o-mini; do
+    if [[ "$MODEL" == "$m" ]]; then
+      echo "  * $m  (current)"
+    else
+      echo "    $m"
+    fi
+  done
+
+  echo ""
+  echo "Gemini:"
+  for m in gemini-pro; do
+    if [[ "$MODEL" == "$m" ]]; then
+      echo "  * $m  (current)"
+    else
+      echo "    $m"
+    fi
+  done
+
+  echo ""
+  echo "Provider: $MODEL_PROVIDER"
+  echo ""
+  echo "Use:"
+  echo "  /model set MODEL_NAME"
+}
+###############################################################################
+# STARTUP BANNER
+###############################################################################
+print_banner() {
+  echo ""
+  echo "────────────────────────────────"
+  if [[ -n "$ONE_SHOT_INPUT" ]]; then
+    echo " GPTX  |  ONE-SHOT MODE"
+  else
+    echo " GPTX  |  INTERACTIVE MODE"
+  fi
+  echo " Provider: $MODEL_PROVIDER"
+  echo " Model:    $MODEL"
+  echo "────────────────────────────────"
+  echo ""
+}
 
 ###############################################################################
 # MAIN LOOP
 ###############################################################################
 typeset -g USER_INPUT=""
 
-while true; do
-  print -n "\n${COLOR_USER}You:${COLOR_RESET} "
+if [[ -n "$ONE_SHOT_INPUT" ]]; then
+  USER_INPUT="$ONE_SHOT_INPUT"
+else
+  while true; do
 
-  [[ -z "$USER_INPUT" ]] && print "(type /help for commands)"
+ print -n "\n${COLOR_USER}You:${COLOR_RESET} "
+ zle -I 2>/dev/null
+ safe_vared USER_INPUT
 
-  safe_vared USER_INPUT
-  USER_INPUT="${USER_INPUT%%[[:space:]]}"
 
-  [[ -z "$USER_INPUT" ]] && continue
+  USER_INPUT="${USER_INPUT#"${USER_INPUT%%[![:space:]]*}"}"
+  USER_INPUT="${USER_INPUT%"${USER_INPUT##*[![:space:]]}"}"
+
+  [[ -z "$USER_INPUT" ]] && {
+    echo "(type /help for commands)"
+    continue
+  }
 
   case "$USER_INPUT" in
+    "/model list") model_list; continue ;;
     "/help") help_cmd; continue ;;
     "/doctor") doctor; continue ;;
+    "/exit") exit_cmd ;;
     "/projects list") projects_list; continue ;;
     "/projects new "*) projects_new "${USER_INPUT#*/projects new }"; continue ;;
     "/projects open "*) projects_open "${USER_INPUT#*/projects open }"; continue ;;
+    "/model show") model_show; continue ;;
+    "/model set "*) model_set "${USER_INPUT#*/model set }"; continue ;;
     "/memory on") MEMORY_ENABLED=1; echo "Memory ENABLED"; continue ;;
     "/memory off") MEMORY_ENABLED=0; echo "Memory DISABLED"; continue ;;
     "/memory show") memory_load | sed 's/^/• /'; continue ;;
+    "/memory prune") memory_prune; echo "Memory pruned"; continue ;;
+    "/permissions show") permissions_show; continue ;;
+    "/permissions edit") permissions_edit; continue ;;
   esac
 
-  RAW=$(
-    OPENAI_CMD api chat.completions.create \
-      --model "$MODEL" \
-      -g system "$SYSTEM_PROMPT" \
-      -g user "$USER_INPUT" \
-      --stream
-  )
+  detect_provider
 
-  echo ""
+case "$MODEL_PROVIDER" in
+  openai)
+    RAW=$(openai_request "$USER_INPUT")
+    ;;
+  gemini)
+    RAW_JSON=$(gemini_request "$USER_INPUT")
+    RAW=$(printf "%s" "$RAW_JSON" | gemini_extract_text)
+    ;;
+  anthropic)
+  RAW_JSON=$(anthropic_request "$USER_INPUT")
+  #echo "----- RAW ANTHROPIC JSON -----"
+  #echo "$RAW_JSON"
+  #echo "------------------------------"
+  RAW=$(printf "%s" "$RAW_JSON" | anthropic_extract_text)
+  ;;
+
+  *)
+    echo "ERROR: Unknown MODEL_PROVIDER=$MODEL_PROVIDER"
+    continue
+    ;;
+esac
+
+if [[ -n "$RAW" ]]; then
   echo "${COLOR_GPT}$RAW${COLOR_RESET}"
+else
+  echo "${COLOR_GPT}(empty response from provider)${COLOR_RESET}"
+fi
+  [[ -n "$ONE_SHOT_INPUT" ]] && exit 0
 
-  if [[ -n "$RAW" && "$RAW" != *"ERROR:"* ]]; then
-    memory_add "user" "$USER_INPUT"
-    memory_add "assistant" "$RAW"
-  fi
+  [[ -n "$RAW" && "$RAW" != *"ERROR"* ]] && {
+    memory_add user "$USER_INPUT"
+    memory_add assistant "$RAW"
+    memory_prune
+  }
 
-  parse_tool_call "$RAW" && run_registered_function
+  parse_tool_call "$RAW" && run_tool
 done
+fi

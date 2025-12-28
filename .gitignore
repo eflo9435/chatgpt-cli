@@ -26,3 +26,4 @@ temp/
 # Editor backups
 *~
 *.swp
+.env
