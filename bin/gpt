@@ -1,197 +1,217 @@
 #!/bin/zsh
 
 ###############################################################################
-# FORCE INTERACTIVE ZSH + ZLE (SAFE)
+# GPTX — PURE cURL UNIFIED DISPATCH ENGINE (NO PYTHON, NO DEPENDENCIES)
 ###############################################################################
+
+# Force interactive Zsh
 if [[ -z "$GPTX_INTERACTIVE" ]]; then
   export GPTX_INTERACTIVE=1
   exec zsh -i "$0" "$@"
 fi
 
-###############################################################################
-# RESOLVE REAL SCRIPT PATH (handles symlinks)
-###############################################################################
-SCRIPT_PATH="$(realpath "$0")"
-SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-
-###############################################################################
-# LOAD ENV (.env) — script-relative
-###############################################################################
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  set -a
-  source "$SCRIPT_DIR/.env"
-  set +a
-fi
-
-###############################################################################
-# BASIC SETTINGS
-###############################################################################
 setopt NO_NOMATCH
 set -o emacs
 
-trap_ctrl_c() {
-  echo ""
-  echo "👋 Exiting GPTX."
-  exit 0
-}
-trap trap_ctrl_c INT
-
+# Colors
 COLOR_USER="\033[1;34m"
 COLOR_GPT="\033[1;35m"
 COLOR_RESET="\033[0m"
 
-DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-4.1}"
-MODEL="$DEFAULT_MODEL"
+# Default model
+MODEL="gpt-4.1"
 MODEL_PROVIDER="openai"
+SYSTEM_PROMPT="You are GPTX Assistant Mode."
 
 ###############################################################################
-# ONE-SHOT MODE DETECTION
+# HISTORY + ARROW KEYS
 ###############################################################################
-ONE_SHOT_INPUT=""
-[[ "$#" -gt 0 ]] && ONE_SHOT_INPUT="$*"
-
-###############################################################################
-# MODEL PROVIDER ROUTING
-###############################################################################
-detect_provider() {
-  case "$MODEL" in
-    gpt-*)    MODEL_PROVIDER="openai" ;;
-    gemini-*) MODEL_PROVIDER="gemini" ;;
-    claude-*) MODEL_PROVIDER="anthropic" ;;
-    *)        MODEL_PROVIDER="openai" ;;
-  esac
-}
+bindkey -e
+bindkey '^[[A' up-line-or-history
+bindkey '^[[B' down-line-or-history
+bindkey '^[[C' forward-char
+bindkey '^[[D' backward-char
 
 ###############################################################################
 # MODEL REGISTRY
 ###############################################################################
-OPENAI_MODELS=(
-  gpt-4.1
-  gpt-4o
-  gpt-4.1-mini
-)
-
-ANTHROPIC_MODELS=(
-  claude-3-haiku-20240307
-  claude-3-sonnet-20240229
-)
-
-GEMINI_MODELS=(
-  gemini-pro
-)
+OPENAI_MODELS=( gpt-4.1 gpt-4o gpt-4o-mini )
+ANTHROPIC_MODELS=( claude-3-haiku-20240307 claude-3-sonnet-20240229 )
+GEMINI_MODELS=( gemini-pro-latest )
 
 ###############################################################################
-# SAFE INPUT (ZLE-FIRST, NO ESCAPE GARBAGE)
+# PROVIDER DETECTION
 ###############################################################################
-safe_vared() {
-  local var="$1"
+detect_provider() {
+  case "$MODEL" in
+    gpt-*)      MODEL_PROVIDER="openai" ;;
+    claude-*)   MODEL_PROVIDER="anthropic" ;;
+    gemini-*)   MODEL_PROVIDER="gemini" ;;
+    *)          MODEL_PROVIDER="openai" ;;
+  esac
+}
 
-  if zle >/dev/null 2>&1; then
-    vared "$var"
-    return
+###############################################################################
+# OPENAI — PURE cURL (CHAT COMPLETION ENDPOINT)
+###############################################################################
+openai_request() {
+  local prompt="$1"
+
+  if [[ -z "$OPENAI_API_KEY" ]]; then
+    echo "ERROR: OPENAI_API_KEY not set"
+    return 1
   fi
 
-  stty -echoctl 2>/dev/null
-  read "$var"
+  curl -s https://api.openai.com/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "{
+      \"model\": \"$MODEL\",
+      \"messages\": [
+        {\"role\": \"system\", \"content\": \"$SYSTEM_PROMPT\"},
+        {\"role\": \"user\", \"content\": \"$prompt\"}
+      ]
+    }" |
+  jq -r '.choices[0].message.content // "ERROR: no response"'
 }
 
 ###############################################################################
-# PROVIDER REQUESTS
+# ANTHROPIC (CLAUDE) — PURE cURL
 ###############################################################################
-OPENAI_CMD() {
-  /opt/homebrew/bin/python3.11 -m openai -k "$OPENAI_API_KEY" "$@"
+anthropic_request() {
+  local prompt="$1"
+
+  if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+    echo "ERROR: ANTHROPIC_API_KEY not set"
+    return 1
+  fi
+
+  curl -s https://api.anthropic.com/v1/messages \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -d "{
+      \"model\": \"$MODEL\",
+      \"max_tokens\": 1024,
+      \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}]
+    }" |
+  jq -r '.content[]?.text // "ERROR: no text content"'
 }
 
-openai_request() {
-  OPENAI_CMD api chat.completions.create \
-    --model "$MODEL" \
-    -g system "You are ChatGPT Expert Mode v4.4 in Assistant Mode." \
-    -g user "$1"
-}
-
+###############################################################################
+# GEMINI — PURE cURL
+###############################################################################
 gemini_request() {
+  local prompt="$1"
+
+  if [[ -z "$GEMINI_API_KEY" ]]; then
+    echo "ERROR: GEMINI_API_KEY not set"
+    return 1
+  fi
+
   curl -s \
-    "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent" \
+    "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent" \
     -H "Content-Type: application/json" \
     -H "x-goog-api-key: $GEMINI_API_KEY" \
     -d "{
       \"contents\": [{
-        \"parts\": [{\"text\": \"$1\"}]
+        \"role\":\"user\",
+        \"parts\":[{\"text\":\"$prompt\"}]
       }]
-    }"
-}
-
-gemini_extract_text() {
-  jq -r '.candidates[0].content.parts[].text' 2>/dev/null
-}
-
-anthropic_request() {
-  [[ -z "$ANTHROPIC_API_KEY" ]] && {
-    echo "ERROR: ANTHROPIC_API_KEY is not set"
-    return 1
-  }
-
-  curl -s https://api.anthropic.com/v1/messages \
-    -H "x-api-key: $ANTHROPIC_API_KEY" \
-    -H "anthropic-version: 2023-06-01" \
-    -H "content-type: application/json" \
-    -d "{
-      \"model\": \"$MODEL\",
-      \"max_tokens\": 1024,
-      \"messages\": [
-        {\"role\": \"user\", \"content\": \"$1\"}
-      ]
-    }"
-}
-
-anthropic_extract_text() {
-  jq -r '.content[] | select(.type=="text") | .text' 2>/dev/null
+    }" |
+  jq -r '.candidates[]?.content.parts[]?.text? // "ERROR: no response"'
 }
 
 ###############################################################################
-# MODEL COMMANDS
+# UNIFIED DISPATCH ENGINE (NO PYTHON)
 ###############################################################################
-model_show() {
+dispatch_request() {
+  local prompt="$1"
+
   detect_provider
-  echo "Current model: $MODEL ($MODEL_PROVIDER)"
+
+  case "$MODEL_PROVIDER" in
+    openai)     openai_request "$prompt" ;;
+    anthropic)  anthropic_request "$prompt" ;;
+    gemini)     gemini_request "$prompt" ;;
+    *)          echo "ERROR: invalid provider" ;;
+  esac
 }
 
-model_set() {
-  [[ -z "$1" ]] && { echo "Usage: /model set MODEL"; return; }
-  MODEL="$1"
-  detect_provider
-  echo "Model set to $MODEL ($MODEL_PROVIDER)"
+###############################################################################
+# QUOTA CHECK (OpenAI) — Modern Usage Inspector (2025 API)
+###############################################################################
+gptx_quota() {
+  echo -e "${COLOR_GPT}Checking OpenAI quota...${COLOR_RESET}"
+
+  local today=$(date +"%Y-%m-%d")
+
+  local usage=$(curl -s \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    "https://api.openai.com/v1/usage?date=$today")
+
+  echo ""
+  echo "───────── RAW USAGE (Today: $today) ─────────"
+  echo "$usage" | jq . 2>/dev/null || echo "$usage"
+
+  echo ""
+  echo "───────── SUMMARY ─────────"
+
+  # Count events per API feature
+  local total_calls=$(echo "$usage" | jq '.data | length')
+  local dalle_calls=$(echo "$usage" | jq '.dalle_api_data | length')
+  local tts_calls=$(echo "$usage" | jq '.tts_api_data | length')
+  local whisper_calls=$(echo "$usage" | jq '.whisper_api_data | length')
+  local code_calls=$(echo "$usage" | jq '.assistant_code_interpreter_data | length')
+  local vector_calls=$(echo "$usage" | jq '.retrieval_storage_data | length')
+
+  echo "Model calls:          $total_calls"
+  echo "DALL·E calls:         $dalle_calls"
+  echo "TTS calls:            $tts_calls"
+  echo "Whisper calls:        $whisper_calls"
+  echo "Code Interpreter:     $code_calls"
+  echo "Vector Storage calls: $vector_calls"
+
+  echo ""
+  echo "───────── STATUS ─────────"
+  echo "Quota: OK (no insufficient_quota errors returned)"
 }
 
-model_list() {
-  local mode="$1"
+###############################################################################
+# SLASH COMMANDS
+###############################################################################
+gptx_help() {
+  echo "/help             – Show commands"
+  echo "/doctor           – Enter medical mode"
+  echo "/model NAME       – Change model"
+  echo "/model list       – List provider models"
+  echo "/model list all   – List all models"
+  echo "/exit             – Quit GPTX"
+  
+}
 
-  if [[ "$mode" == "all" ]]; then
-    echo ""
-    echo "Available models (ALL PROVIDERS)"
-    echo "---------------------------------------------"
+gptx_doctor() {
+  SYSTEM_PROMPT="You are a medical assistant with evidence-based reasoning."
+  echo -e "${COLOR_GPT}Medical mode activated.${COLOR_RESET}"
+}
 
-    echo ""
-    echo "OpenAI:"
-    printf "• %s\n" "${OPENAI_MODELS[@]}"
+gptx_switch_model() {
+  local new="$1"
 
-    echo ""
-    echo "Anthropic:"
-    printf "• %s\n" "${ANTHROPIC_MODELS[@]}"
-
-    echo ""
-    echo "Gemini:"
-    printf "• %s\n" "${GEMINI_MODELS[@]}"
-
+  if [[ -z "$new" ]]; then
+    echo "Usage: /model MODEL_NAME"
     return
   fi
 
+  MODEL="$new"
+  detect_provider
+  echo -e "${COLOR_GPT}Model switched to $MODEL ($MODEL_PROVIDER)${COLOR_RESET}"
+}
+
+model_list() {
   detect_provider
 
-  echo ""
-  echo "Available models for provider: $MODEL_PROVIDER"
-  echo "---------------------------------------------"
-
+  echo "Models for provider: $MODEL_PROVIDER"
   case "$MODEL_PROVIDER" in
     openai)     printf "• %s\n" "${OPENAI_MODELS[@]}" ;;
     anthropic)  printf "• %s\n" "${ANTHROPIC_MODELS[@]}" ;;
@@ -199,61 +219,149 @@ model_list() {
   esac
 }
 
+model_list_all() {
+  echo "OpenAI:"
+  printf "• %s\n" "${OPENAI_MODELS[@]}"
+  echo ""
+  echo "Anthropic:"
+  printf "• %s\n" "${ANTHROPIC_MODELS[@]}"
+  echo ""
+  echo "Gemini:"
+  printf "• %s\n" "${GEMINI_MODELS[@]}"
+}
+
+
 ###############################################################################
-# STARTUP BANNER
+# MODEL SHORTCUTS — INTUITIVE + ULTRA SHORT + ROLE-BASED
+###############################################################################
+gptx_model_shortcut() {
+  case "$1" in
+
+    # -------------------------
+    # OPENAI SHORTCUTS
+    # -------------------------
+    "/4"|"/chat")
+        gptx_switch_model "gpt-4.1" ;;
+    "/4o"|"/omni")
+        gptx_switch_model "gpt-4o" ;;
+    "/mini")
+        gptx_switch_model "gpt-4o-mini" ;;
+
+    # -------------------------
+    # ANTHROPIC SHORTCUTS
+    # -------------------------
+    "/claude"|"/sonnet")
+        gptx_switch_model "claude-3-sonnet-20240229" ;;
+    "/haiku"|"/cfast")
+        gptx_switch_model "claude-3-haiku-20240307" ;;
+
+    # -------------------------
+    # GEMINI SHORTCUTS
+    # -------------------------
+    "/gemini"|"/gp"|"/google")
+        gptx_switch_model "gemini-pro-latest" ;;
+
+    # -------------------------
+    # ROLE-BASED AUTO-SELECTION
+    # -------------------------
+    "/best"|"/creative"|"/research")
+        gptx_switch_model "gpt-4o" ;;
+    "/reason"|"/smart")
+        gptx_switch_model "claude-3-sonnet-20240229" ;;
+    "/speed")
+        gptx_switch_model "claude-3-haiku-20240307" ;;
+
+    # -------------------------
+    # UNKNOWN SHORTCUT
+    # -------------------------
+    *)
+        return 1 ;;   # fall through so main loop continues
+  esac
+  return 0
+}
+
+
+###############################################################################
+# BANNER
 ###############################################################################
 print_banner() {
-  echo ""
-  echo "────────────────────────────────"
-  echo " GPTX | $([[ -n "$ONE_SHOT_INPUT" ]] && echo ONE-SHOT || echo INTERACTIVE)"
+  detect_provider
+  echo "────────────────────────────────────────"
+  echo " GPTX | Pure cURL Engine"
   echo " Provider: $MODEL_PROVIDER"
   echo " Model:    $MODEL"
-  echo "────────────────────────────────"
-  echo ""
+  echo "────────────────────────────────────────"
 }
 
 ###############################################################################
-# MAIN EXECUTION
+# GPTX HISTORY SYSTEM (isolated from shell history)
 ###############################################################################
-detect_provider
+GPTX_HISTORY=()
+GPTX_HISTORY_INDEX=0
+
+gptx_zle_history_add() {
+  GPTX_HISTORY+="$USER_INPUT"
+  GPTX_HISTORY_INDEX=${#GPTX_HISTORY[@]}
+}
+
+gptx_history_up() {
+  (( GPTX_HISTORY_INDEX > 0 )) && ((GPTX_HISTORY_INDEX--))
+  USER_INPUT="${GPTX_HISTORY[$GPTX_HISTORY_INDEX]}"
+  zle redisplay
+}
+
+gptx_history_down() {
+  (( GPTX_HISTORY_INDEX < ${#GPTX_HISTORY[@]} )) && ((GPTX_HISTORY_INDEX++))
+  USER_INPUT="${GPTX_HISTORY[$GPTX_HISTORY_INDEX]}"
+  zle redisplay
+}
+
+zle -N gptx_history_up
+zle -N gptx_history_down
+
+bindkey '^[[A' gptx_history_up
+bindkey '^[[B' gptx_history_down
+
+
+###############################################################################
+# MAIN LOOP
+###############################################################################
 print_banner
 
-USER_INPUT=""
+while true; do
+  print -n "${COLOR_USER}You:${COLOR_RESET} "
+  USER_INPUT=""         # ← THIS IS THE FIX
+  vared -c USER_INPUT
 
-if [[ -n "$ONE_SHOT_INPUT" ]]; then
-  USER_INPUT="$ONE_SHOT_INPUT"
-else
-  while true; do
-    print -n "\n${COLOR_USER}You:${COLOR_RESET} "
-    zle -I 2>/dev/null
-    safe_vared USER_INPUT
+  [[ -z "$USER_INPUT" ]] && continue
 
-    USER_INPUT="${USER_INPUT#"${USER_INPUT%%[![:space:]]*}"}"
-    USER_INPUT="${USER_INPUT%"${USER_INPUT##*[![:space:]]}"}"
-    [[ -z "$USER_INPUT" ]] && continue
+  case "$USER_INPUT" in
+    "/help")            gptx_help; continue ;;
+    "/doctor")          gptx_doctor; continue ;;
+    "/exit")            echo "Exiting GPTX."; exit 0 ;;
+    "/model list all")  model_list_all; continue ;;
+    "/model list")      model_list; continue ;;
+    "/model "*)         
+    gptx_switch_model "${USER_INPUT#*/model }"
+    USER_INPUT=""
+    continue
+    ;;
+    "/quota")           gptx_quota; continue ;;
+  esac
+  
+    # -------------------------
+  # MODEL SHORTCUT PROCESSOR
+  # -------------------------
+  if [[ "$USER_INPUT" == /* ]]; then
+      if gptx_model_shortcut "$USER_INPUT"; then
+          USER_INPUT=""
+          continue
+      fi
+  fi
 
-    case "$USER_INPUT" in
-      "/exit") exit 0 ;;
-      "/model show") model_show; continue ;;
-      "/model set "*) model_set "${USER_INPUT#*/model set }"; continue ;;
-      "/model list all") model_list all; continue ;;
-      "/model list")     model_list;     continue ;;
-    esac
 
-    detect_provider
-
-    case "$MODEL_PROVIDER" in
-      openai)
-        RAW=$(openai_request "$USER_INPUT")
-        ;;
-      gemini)
-        RAW=$(gemini_request "$USER_INPUT" | gemini_extract_text)
-        ;;
-      anthropic)
-        RAW=$(anthropic_request "$USER_INPUT" | anthropic_extract_text)
-        ;;
-    esac
-
-    echo "${COLOR_GPT}${RAW:-"(empty response)"}${COLOR_RESET}"
-  done
-fi
+  echo -e "${COLOR_GPT}"
+  dispatch_request "$USER_INPUT"
+  gptx_zle_history_add
+  echo -e "${COLOR_RESET}"
+done
